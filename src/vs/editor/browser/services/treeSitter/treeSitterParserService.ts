@@ -5,7 +5,7 @@
 
 import { TreeSitterTokenizationRegistry } from 'vs/editor/common/languages';
 import type { Parser } from '@vscode/tree-sitter-wasm';
-import { AppResourcePath, FileAccess, nodeModulesPath } from 'vs/base/common/network';
+import { AppResourcePath, FileAccess, nodeModulesAsarUnpackedPath, nodeModulesPath } from 'vs/base/common/network';
 import { ITreeSitterParserService } from 'vs/editor/common/services/treeSitterParserService';
 import { IModelService } from 'vs/editor/common/services/model';
 import { Disposable, DisposableMap, DisposableStore, IDisposable } from 'vs/base/common/lifecycle';
@@ -19,10 +19,18 @@ import { setTimeout0 } from 'vs/base/common/platform';
 import { importAMDNodeModule } from 'vs/amdX';
 import { Event } from 'vs/base/common/event';
 import { cancelOnDispose } from 'vs/base/common/cancellation';
+import { IEnvironmentService } from 'vs/platform/environment/common/environment';
+import { canASAR } from 'vs/base/common/amd';
 
 const EDITOR_EXPERIMENTAL_PREFER_TREESITTER = 'editor.experimental.preferTreeSitter';
-const moduleLocationTreeSitter: AppResourcePath = `${nodeModulesPath}/@vscode/tree-sitter-wasm/wasm`;
-const moduleLocationTreeSitterWasm: AppResourcePath = `${moduleLocationTreeSitter}/tree-sitter.wasm`;
+const EDITOR_TREESITTER_TELEMETRY = 'editor.experimental.treeSitterTelemetry';
+const MODULE_LOCATION_SUBPATH = `@vscode/tree-sitter-wasm/wasm`;
+const FILENAME_TREESITTER_WASM = `tree-sitter.wasm`;
+
+function getModuleLocation(environmentService: IEnvironmentService): AppResourcePath {
+	return `${(canASAR && environmentService.isBuilt) ? nodeModulesAsarUnpackedPath : nodeModulesPath}/${MODULE_LOCATION_SUBPATH}`;
+}
+
 
 export class TextModelTreeSitter extends Disposable {
 	private _treeSitterTree: TreeSitterTree | undefined;
@@ -72,6 +80,11 @@ export class TextModelTreeSitter extends Disposable {
 	private async _onDidChangeContent(treeSitterTree: TreeSitterTree, e?: IModelContentChangedEvent) {
 		return treeSitterTree.onDidChangeContent(this.model, e);
 	}
+}
+
+const enum TelemetryParseType {
+	Full = 'fullParse',
+	Incremental = 'incrementalParse'
 }
 
 export class TreeSitterTree implements IDisposable {
@@ -131,16 +144,14 @@ export class TreeSitterTree implements IDisposable {
 	}
 
 	private parse(model: ITextModel): Promise<Parser.Tree | undefined> {
-		let telemetryTag: string;
+		let parseType: TelemetryParseType = TelemetryParseType.Full;
 		if (this.tree) {
-			telemetryTag = 'incrementalParse';
-		} else {
-			telemetryTag = 'fullParse';
+			parseType = TelemetryParseType.Incremental;
 		}
-		return this._parseAndYield(model, telemetryTag);
+		return this._parseAndYield(model, parseType);
 	}
 
-	private async _parseAndYield(model: ITextModel, telemetryTag: string): Promise<Parser.Tree | undefined> {
+	private async _parseAndYield(model: ITextModel, parseType: TelemetryParseType): Promise<Parser.Tree | undefined> {
 		const language = model.getLanguageId();
 		let tree: Parser.Tree | undefined;
 		let time: number = 0;
@@ -163,7 +174,7 @@ export class TreeSitterTree implements IDisposable {
 				return;
 			}
 		} while (!tree);
-		this.sendParseTimeTelemetry(telemetryTag, language, time, passes);
+		this.sendParseTimeTelemetry(parseType, language, time, passes);
 		return tree;
 	}
 
@@ -171,8 +182,8 @@ export class TreeSitterTree implements IDisposable {
 		return textModel.getTextBuffer().getNearestChunk(index);
 	}
 
-	private sendParseTimeTelemetry(eventName: string, languageId: string, time: number, passes: number): void {
-		this._logService.debug(`Tree parsing (${eventName}) took ${time} ms and ${passes} passes.`);
+	private sendParseTimeTelemetry(parseType: TelemetryParseType, languageId: string, time: number, passes: number): void {
+		this._logService.debug(`Tree parsing (${parseType}) took ${time} ms and ${passes} passes.`);
 		type ParseTimeClassification = {
 			owner: 'alros';
 			comment: 'Used to understand how long it takes to parse a tree-sitter tree';
@@ -180,7 +191,11 @@ export class TreeSitterTree implements IDisposable {
 			time: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The ms it took to parse' };
 			passes: { classification: 'SystemMetaData'; purpose: 'FeatureInsight'; comment: 'The number of passes it took to parse' };
 		};
-		this._telemetryService.publicLog2<{ languageId: string; time: number; passes: number }, ParseTimeClassification>(`treeSitter.${eventName}`, { languageId, time, passes });
+		if (parseType === TelemetryParseType.Full) {
+			this._telemetryService.publicLog2<{ languageId: string; time: number; passes: number }, ParseTimeClassification>(`treeSitter.fullParse`, { languageId, time, passes });
+		} else {
+			this._telemetryService.publicLog2<{ languageId: string; time: number; passes: number }, ParseTimeClassification>(`treeSitter.incrementalParse`, { languageId, time, passes });
+		}
 	}
 }
 
@@ -188,7 +203,8 @@ export class TreeSitterLanguages extends Disposable {
 	private _languages: Map<string, Parser.Language> = new Map();
 
 	constructor(private readonly _treeSitterImporter: TreeSitterImporter,
-		private readonly _fileService: IFileService
+		private readonly _fileService: IFileService,
+		private readonly _environmentService: IEnvironmentService
 	) {
 		super();
 	}
@@ -222,7 +238,7 @@ export class TreeSitterLanguages extends Disposable {
 		if (!grammarName) {
 			return undefined;
 		}
-		return moduleLocationTreeSitter;
+		return getModuleLocation(this._environmentService);
 	}
 }
 
@@ -257,9 +273,10 @@ export class TreeSitterTextModelService extends Disposable implements ITreeSitte
 		@ITelemetryService private readonly _telemetryService: ITelemetryService,
 		@ILogService private readonly _logService: ILogService,
 		@IConfigurationService private readonly _configurationService: IConfigurationService,
+		@IEnvironmentService private readonly _environmentService: IEnvironmentService
 	) {
 		super();
-		this._treeSitterParser = this._register(new TreeSitterLanguages(this._treeSitterImporter, fileService));
+		this._treeSitterParser = this._register(new TreeSitterLanguages(this._treeSitterImporter, fileService, this._environmentService));
 		this._register(this._configurationService.onDidChangeConfiguration(e => {
 			if (e.affectsConfiguration(EDITOR_EXPERIMENTAL_PREFER_TREESITTER)) {
 				this._supportedLanguagesChanged();
@@ -270,9 +287,10 @@ export class TreeSitterTextModelService extends Disposable implements ITreeSitte
 
 	private async _doInitParser() {
 		const Parser = await this._treeSitterImporter.getParserClass();
+		const environmentService = this._environmentService;
 		await Parser.init({
 			locateFile(_file: string, _folder: string) {
-				return FileAccess.asBrowserUri(moduleLocationTreeSitterWasm).toString(true);
+				return FileAccess.asBrowserUri(`${getModuleLocation(environmentService)}/${FILENAME_TREESITTER_WASM}`).toString(true);
 			}
 		});
 		return true;
@@ -315,7 +333,16 @@ export class TreeSitterTextModelService extends Disposable implements ITreeSitte
 	}
 
 	private _getSetting(): string[] {
-		return this._configurationService.getValue<string[]>(EDITOR_EXPERIMENTAL_PREFER_TREESITTER) || [];
+		const setting = this._configurationService.getValue<string[]>(EDITOR_EXPERIMENTAL_PREFER_TREESITTER);
+		if (setting && setting.length > 0) {
+			return setting;
+		} else {
+			const expSetting = this._configurationService.getValue<boolean>(EDITOR_TREESITTER_TELEMETRY);
+			if (expSetting) {
+				return ['typescript'];
+			}
+		}
+		return [];
 	}
 
 	private async _registerModelServiceListeners() {
